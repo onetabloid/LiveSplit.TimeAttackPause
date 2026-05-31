@@ -18,13 +18,118 @@ namespace LiveSplit.UI.Components
         // This object contains all of the current information about the splits, the timer, etc.
         private LiveSplitState CurrentState { get; set; }
 
-        // Track the last split index we auto-saved to detect when a new split completes
-        private int lastAutoSavedSplitIndex = -1;
+        // Track the last seen split index to detect when the run's split index changes
+        private int lastSeenSplitIndex = -1;
         // Cached autosave filename for the active run so multiple autosaves don't overwrite different files
         private string cachedAutoSaveFileName = null;
 
-        public override string ComponentName => "TimeAttackPause";
+        // Builds and caches the autosave filename. If runStartTime is provided, it will be used
+        // as the timestamp for the filename. Otherwise the method will attempt to discover
+        // the run start time via LiveSplitState properties or fall back to estimating from CurrentTime.
+        private void EnsureCachedAutoSaveFileName(DateTime? runStartTime = null)
+        {
+            if (!string.IsNullOrEmpty(cachedAutoSaveFileName)) return;
 
+            try
+            {
+                // Build a descriptive autosave filename: [Game Name] - [Category Name] - [timestamp]
+                string gameName = "Unknown Game";
+                string categoryName = "Unknown Category";
+                try
+                {
+                    if (CurrentState?.Run != null)
+                    {
+                        gameName = string.IsNullOrEmpty(CurrentState.Run.GameName) ? gameName : CurrentState.Run.GameName;
+                        categoryName = string.IsNullOrEmpty(CurrentState.Run.CategoryName) ? categoryName : CurrentState.Run.CategoryName;
+                    }
+                }
+                catch { }
+
+                DateTime startTime = DateTime.Now;
+                if (runStartTime.HasValue)
+                {
+                    startTime = runStartTime.Value;
+                }
+                else
+                {
+                    try
+                    {
+                        object candidate = null;
+                        var state = CurrentState;
+                        if (state != null)
+                        {
+                            var t = state.GetType();
+                            var prop = t.GetProperty("AdjustedStartTime");
+                            if (prop != null)
+                                candidate = prop.GetValue(state);
+                            if (candidate == null)
+                            {
+                                prop = t.GetProperty("AttemptStarted");
+                                if (prop != null)
+                                    candidate = prop.GetValue(state);
+                            }
+                            if (candidate == null)
+                            {
+                                prop = t.GetProperty("AttemptStartedTime");
+                                if (prop != null)
+                                    candidate = prop.GetValue(state);
+                            }
+                        }
+
+                        if (candidate != null)
+                        {
+                            if (candidate is DateTime dt)
+                            {
+                                startTime = dt;
+                            }
+                            else if (candidate is DateTimeOffset dto)
+                            {
+                                startTime = dto.LocalDateTime;
+                            }
+                            else
+                            {
+                                var candType = candidate.GetType();
+                                var toDate = candType.GetMethod("ToDateTime", Type.EmptyTypes);
+                                if (toDate != null)
+                                {
+                                    var res = toDate.Invoke(candidate, null);
+                                    if (res is DateTime dt2) startTime = dt2;
+                                }
+                                else
+                                {
+                                    var dateProp = candType.GetProperty("DateTime") ?? candType.GetProperty("LocalDateTime") ?? candType.GetProperty("Value");
+                                    if (dateProp != null)
+                                    {
+                                        var res = dateProp.GetValue(candidate);
+                                        if (res is DateTime dt3) startTime = dt3;
+                                        else if (res is DateTimeOffset dto2) startTime = dto2.LocalDateTime;
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            var tm = CurrentState.CurrentTimingMethod;
+                            var elapsed = CurrentState.CurrentTime[tm] ?? TimeSpan.Zero;
+                            startTime = DateTime.Now - elapsed;
+                        }
+                    }
+                    catch { }
+                }
+
+                string timestamp = startTime.ToString("yyyy-MM-dd-HH.mm.ss");
+                string fileName = $"{gameName} - {categoryName} - {timestamp}.json";
+                foreach (var c in System.IO.Path.GetInvalidFileNameChars())
+                {
+                    fileName = fileName.Replace(c, '_');
+                }
+
+                cachedAutoSaveFileName = fileName;
+            }
+            catch { }
+        }
+
+        public override string ComponentName => "TimeAttackPause";
         public override float HorizontalWidth => 0;
         public override float MinimumWidth => 0;
         public override float VerticalHeight => 0;
@@ -94,9 +199,7 @@ namespace LiveSplit.UI.Components
 
             SplitStateImporter.ImportState(openFileDialog.FileName, CurrentState, Model);
 
-            // Update auto-save tracking to the imported state
-            lastAutoSavedSplitIndex = CurrentState.CurrentSplitIndex;
-            // Clear cached filename so imported run gets a fresh filename
+            lastSeenSplitIndex = CurrentState.CurrentSplitIndex;
             cachedAutoSaveFileName = null;
         }
 
@@ -131,25 +234,36 @@ namespace LiveSplit.UI.Components
         {
             CurrentState = state;
 
-            // If the split index decreased (because of a reset or undo), bring our
-            // tracking index in sync so future splits will trigger autosave.
-            if (CurrentState.CurrentSplitIndex < lastAutoSavedSplitIndex)
+            // Detect split index changes (increase = new split, decrease = reset/undo)
+            if (CurrentState.CurrentSplitIndex < lastSeenSplitIndex)
             {
                 try
                 {
-                    System.Diagnostics.Debug.WriteLine($"TimeAttackPause: detected split index decrease from {lastAutoSavedSplitIndex} to {CurrentState.CurrentSplitIndex}, syncing tracker.");
+                    System.Diagnostics.Debug.WriteLine($"TimeAttackPause: detected split index decrease from {lastSeenSplitIndex} to {CurrentState.CurrentSplitIndex}, syncing tracker.");
                 }
                 catch { }
-                lastAutoSavedSplitIndex = CurrentState.CurrentSplitIndex;
-                // Clear cached filename when the run resets/rewinds so a new run will get a new filename
-                cachedAutoSaveFileName = null;
+                lastSeenSplitIndex = CurrentState.CurrentSplitIndex;
+                // Clear cached filename only when the run is reset to the very start (index == 0)
+                if (CurrentState.CurrentSplitIndex == 0)
+                {
+                    cachedAutoSaveFileName = null;
+                }
             }
-
-            // Auto-save after each split completes. Do not autosave on timer start (index 0)
-            if (CurrentState.CurrentSplitIndex > lastAutoSavedSplitIndex && CurrentState.CurrentSplitIndex > 0)
+            else if (CurrentState.CurrentSplitIndex > lastSeenSplitIndex)
             {
-                AutoSaveRun();
-                lastAutoSavedSplitIndex = CurrentState.CurrentSplitIndex;
+                // If the run just started (0 -> 1) capture the system start time and cache the filename
+                if (lastSeenSplitIndex == 0 && CurrentState.CurrentSplitIndex == 1)
+                {
+                    EnsureCachedAutoSaveFileName(DateTime.Now);
+                }
+
+                // Auto-save when the split index increases (but not on the initial start at index 0)
+                if (CurrentState.CurrentSplitIndex > 0)
+                {
+                    AutoSaveRun();
+                }
+
+                lastSeenSplitIndex = CurrentState.CurrentSplitIndex;
             }
         }
 
@@ -285,10 +399,7 @@ namespace LiveSplit.UI.Components
                         }
                         catch { }
 
-                        // Combine date and time into a single readable timestamp. Use a safe filename format
-                        // that approximates the requested YYYY/MM/DD:hh:mm:ss but avoids characters
-                        // invalid in filenames. Result: yyyy-MM-dd_HH-mm-ss
-                        string timestamp = startTime.ToString("yyyy-MM-dd_HH-mm-ss");
+                        string timestamp = startTime.ToString("yyyy-MM-dd HH.mm.ss");
                         string fileName = $"{gameName} - {categoryName} - {timestamp}.json";
                         // Remove or replace invalid filename chars
                         foreach (var c in System.IO.Path.GetInvalidFileNameChars())
@@ -296,12 +407,10 @@ namespace LiveSplit.UI.Components
                             fileName = fileName.Replace(c, '_');
                         }
 
-                        if (string.IsNullOrEmpty(cachedAutoSaveFileName))
-                        {
-                            cachedAutoSaveFileName = fileName;
-                        }
-
-                        string filePath = System.IO.Path.Combine(autoSaveDir, cachedAutoSaveFileName);
+                        // Ensure the cached filename exists; if the run start has been captured earlier
+                        // it will be used. Otherwise compute it now (best effort).
+                        EnsureCachedAutoSaveFileName();
+                        string filePath = System.IO.Path.Combine(autoSaveDir, cachedAutoSaveFileName ?? fileName);
                         SplitsStateWriter.SaveSplitsState(CurrentState, filePath);
                         System.Diagnostics.Debug.WriteLine($"TimeAttackPause autosave saved to: {filePath}");
                         saved = true;

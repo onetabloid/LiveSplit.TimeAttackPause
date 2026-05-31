@@ -1,5 +1,7 @@
 ﻿#nullable enable
 using System;
+using System.Windows.Forms;
+using System.Threading;
 using System.IO;
 using LiveSplit.Model;
 using Newtonsoft.Json;
@@ -13,25 +15,41 @@ namespace LiveSplit.TimeAttackPause.IO
         {
             // read all the text from the file as string
             string jsonString = File.ReadAllText(filepath);
-            Run? runDto = JsonConvert.DeserializeObject<Run>(jsonString);
-            if (runDto == null)
+            Run? runToImport = JsonConvert.DeserializeObject<Run>(jsonString);
+            if (runToImport == null)
             {
                 return;
             }
             
-            timerModel.Start();
-
-            var i = 0;
-            foreach (var segment in state.Run)
+            try
             {
-                segment.SplitTime = new Time(runDto.TimingMethod, runDto.Splits[i].Time);
-                i += 1;
+                timerModel.Start();
+
+                for (var i = 0; i < runToImport.CurrentSplitIndex; i++)
+                {
+                    timerModel.Split();
+                    Application.DoEvents();
+                    Thread.Sleep(50);
+                }
+
+                var splitIndex = 0;
+                foreach (var segment in state.Run)
+                {
+                    segment.SplitTime = new Time(runToImport.TimingMethod, runToImport.Splits[splitIndex].Time);
+                    splitIndex += 1;
+                }
+
+
+                state.AdjustedStartTime = TimeStamp.Now - runToImport.CurrentTime.GetValueOrDefault(TimeSpan.Zero);
+                state.IsGameTimeInitialized = true;
+
+                timerModel.Pause();
+
             }
-            
-            state.CurrentSplitIndex = runDto.CurrentSplitIndex;
-            state.AdjustedStartTime = TimeStamp.Now - runDto.CurrentTime.GetValueOrDefault(TimeSpan.Zero);
-            state.IsGameTimeInitialized = true;
-            timerModel.Pause();
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"SplitStateImporter.ImportState encountered an error while applying run data: {ex.Message}");
+            }
         }
     }
 }
