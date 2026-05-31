@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Windows.Forms;
 using System.Xml;
@@ -270,6 +271,11 @@ namespace LiveSplit.UI.Components
         // Auto-saves the current run state to guard against PC crashes
         private void AutoSaveRun()
         {
+            if (ImportContext.IsImporting)
+            {
+                System.Diagnostics.Debug.WriteLine("Import in progress, Auto-Saves paused");
+                return;
+            }
             try
             {
 
