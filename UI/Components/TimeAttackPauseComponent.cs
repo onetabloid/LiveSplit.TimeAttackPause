@@ -1,12 +1,13 @@
-﻿using System;
+﻿using LiveSplit.Model;
+using LiveSplit.TimeAttackPause.IO;
+using LiveSplit.TimeAttackPause.UI.Components;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO;
 using System.Windows.Forms;
 using System.Xml;
-using LiveSplit.Model;
-using LiveSplit.TimeAttackPause.IO;
-using LiveSplit.TimeAttackPause.UI.Components;
 
 namespace LiveSplit.UI.Components
 {
@@ -29,105 +30,42 @@ namespace LiveSplit.UI.Components
         // the run start time via LiveSplitState properties or fall back to estimating from CurrentTime.
         private void EnsureCachedAutoSaveFileName(DateTime? runStartTime = null)
         {
-            if (!string.IsNullOrEmpty(cachedAutoSaveFileName)) return;
-
-            try
+            if (!string.IsNullOrEmpty(cachedAutoSaveFileName))
             {
-                // Build a descriptive autosave filename: [Game Name] - [Category Name] - [timestamp]
-                string gameName = "Unknown Game";
-                string categoryName = "Unknown Category";
-                try
-                {
-                    if (CurrentState?.Run != null)
-                    {
-                        gameName = string.IsNullOrEmpty(CurrentState.Run.GameName) ? gameName : CurrentState.Run.GameName;
-                        categoryName = string.IsNullOrEmpty(CurrentState.Run.CategoryName) ? categoryName : CurrentState.Run.CategoryName;
-                    }
-                }
-                catch { }
-
-                DateTime startTime = DateTime.Now;
-                if (runStartTime.HasValue)
-                {
-                    startTime = runStartTime.Value;
-                }
-                else
-                {
-                    try
-                    {
-                        object candidate = null;
-                        var state = CurrentState;
-                        if (state != null)
-                        {
-                            var t = state.GetType();
-                            var prop = t.GetProperty("AdjustedStartTime");
-                            if (prop != null)
-                                candidate = prop.GetValue(state);
-                            if (candidate == null)
-                            {
-                                prop = t.GetProperty("AttemptStarted");
-                                if (prop != null)
-                                    candidate = prop.GetValue(state);
-                            }
-                            if (candidate == null)
-                            {
-                                prop = t.GetProperty("AttemptStartedTime");
-                                if (prop != null)
-                                    candidate = prop.GetValue(state);
-                            }
-                        }
-
-                        if (candidate != null)
-                        {
-                            if (candidate is DateTime dt)
-                            {
-                                startTime = dt;
-                            }
-                            else if (candidate is DateTimeOffset dto)
-                            {
-                                startTime = dto.LocalDateTime;
-                            }
-                            else
-                            {
-                                var candType = candidate.GetType();
-                                var toDate = candType.GetMethod("ToDateTime", Type.EmptyTypes);
-                                if (toDate != null)
-                                {
-                                    var res = toDate.Invoke(candidate, null);
-                                    if (res is DateTime dt2) startTime = dt2;
-                                }
-                                else
-                                {
-                                    var dateProp = candType.GetProperty("DateTime") ?? candType.GetProperty("LocalDateTime") ?? candType.GetProperty("Value");
-                                    if (dateProp != null)
-                                    {
-                                        var res = dateProp.GetValue(candidate);
-                                        if (res is DateTime dt3) startTime = dt3;
-                                        else if (res is DateTimeOffset dto2) startTime = dto2.LocalDateTime;
-                                    }
-                                }
-                            }
-                        }
-                        else
-                        {
-                            var tm = CurrentState.CurrentTimingMethod;
-                            var elapsed = CurrentState.CurrentTime[tm] ?? TimeSpan.Zero;
-                            startTime = DateTime.Now - elapsed;
-                        }
-                    }
-                    catch { }
-                }
-
-                string timestamp = startTime.ToString("yyyy-MM-dd-HH.mm.ss");
-                string fileName = $"{gameName} - {categoryName} - {timestamp}.json";
-                foreach (var c in System.IO.Path.GetInvalidFileNameChars())
-                {
-                    fileName = fileName.Replace(c, '_');
-                }
-
-                cachedAutoSaveFileName = fileName;
+                return;
             }
-            catch { }
+
+            var gameName = GetValueOrDefault(CurrentState?.Run?.GameName, "Unknown Game");
+            var categoryName = GetValueOrDefault(CurrentState?.Run?.CategoryName, "Unknown Category");
+            var startTime = runStartTime ?? GetRunStartTime();
+
+            var timestamp = startTime.ToString("yyyy-MM-dd-HH.mm.ss");
+            var fileName = $"{gameName} - {categoryName} - {timestamp}.json";
+
+            cachedAutoSaveFileName = SanitiseFileName(fileName);
+        }
+
+        private static string GetValueOrDefault(string value, string fallback)
+        {
+            return string.IsNullOrWhiteSpace(value) ? fallback : value;
+        }
+
+        private DateTime GetRunStartTime()
+        {
+            var timingMethod = CurrentState.CurrentTimingMethod;
+            var elapsed = CurrentState.CurrentTime[timingMethod] ?? TimeSpan.Zero;
+
+            return DateTime.Now - elapsed;
+        }
+
+        private static string SanitiseFileName(string fileName)
+        {
+            foreach (var invalidCharacter in Path.GetInvalidFileNameChars())
+            {
+                fileName = fileName.Replace(invalidCharacter, '_');
+            }
+
+            return fileName;
         }
 
         public override string ComponentName => "TimeAttackPause";
@@ -268,175 +206,95 @@ namespace LiveSplit.UI.Components
             }
         }
 
-        // Auto-saves the current run state to guard against PC crashes
+        // Auto-saves the current run state
         private void AutoSaveRun()
+        {
+            if (ShouldSkipAutoSave())
+            {
+                return;
+            }
+
+            foreach (var directory in GetAutoSaveDirectoryCandidates())
+            {
+                if (TryAutoSaveToDirectory(directory))
+                {
+                    return;
+                }
+            }
+
+            Debug.WriteLine("TimeAttackPause autosave failed: no writable directory found.");
+        }
+
+        private bool ShouldSkipAutoSave()
         {
             if (ImportContext.IsImporting)
             {
-                System.Diagnostics.Debug.WriteLine("Import in progress, Auto-Saves paused");
-                return;
+                Debug.WriteLine("Import in progress, Auto-Saves paused");
+                return true;
             }
+
+            if (Settings?.EnableAutosave == false)
+            {
+                Debug.WriteLine("TimeAttackPause autosave skipped because EnableAutosave is false.");
+                return true;
+            }
+
+            return false;
+        }
+
+        private IEnumerable<string> GetAutoSaveDirectoryCandidates()
+        {
+            if (!string.IsNullOrWhiteSpace(Settings?.DefaultSavePath))
+            {
+                yield return Settings.DefaultSavePath;
+            }
+
+            yield return Path.Combine(GetApplicationRoot(), "TimeAttackPauseAutosaves");
+
+            yield return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                "LiveSplit",
+                "TimeAttackPauseAutosaves"
+            );
+
+            yield return Path.GetTempPath();
+        }
+
+        private string GetApplicationRoot()
+        {
             try
             {
+                return Application.StartupPath;
+            }
+            catch
+            {
+                return AppDomain.CurrentDomain.BaseDirectory;
+            }
+        }
 
-                // If settings exists and autosave is disabled, skip autosave
-                if (Settings != null && Settings.EnableAutosave == false)
+        private bool TryAutoSaveToDirectory(string directory)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(directory))
                 {
-                    System.Diagnostics.Debug.WriteLine("TimeAttackPause autosave skipped because EnableAutosave is false.");
-                    return;
+                    return false;
                 }
 
-                // Build candidate directories in order of preference
-                var candidates = new List<string>();
-                try
-                {
-                    var settings = Settings;
-                    if (settings != null && !string.IsNullOrEmpty(settings.DefaultSavePath))
-                        candidates.Add(settings.DefaultSavePath);
-                }
-                catch
-                {
-                    // ignore
-                }
+                Directory.CreateDirectory(directory);
 
-                string processRoot = null;
-                try
-                {
-                    processRoot = Application.StartupPath;
-                }
-                catch
-                {
-                    processRoot = AppDomain.CurrentDomain.BaseDirectory;
-                }
-                candidates.Add(System.IO.Path.Combine(processRoot, "TimeAttackPauseAutosaves"));
+                EnsureCachedAutoSaveFileName();
 
-                candidates.Add(System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "LiveSplit", "TimeAttackPauseAutosaves"));
+                var filePath = Path.Combine(directory, cachedAutoSaveFileName);
+                SplitsStateWriter.SaveSplitsState(CurrentState, filePath);
 
-                candidates.Add(System.IO.Path.GetTempPath());
-
-                bool saved = false;
-                foreach (var dir in candidates)
-                {
-                    try
-                    {
-                        var autoSaveDir = dir;
-                        if (string.IsNullOrEmpty(autoSaveDir)) continue;
-                        System.IO.Directory.CreateDirectory(autoSaveDir);
-                        // Build a descriptive autosave filename: [Game Name] - [Category Name] - [Date] - [Time the run Started]
-                        string gameName = "Unknown Game";
-                        string categoryName = "Unknown Category";
-                        try
-                        {
-                            // LiveSplit's Run typically exposes GameName and CategoryName
-                            if (CurrentState?.Run != null)
-                            {
-                                gameName = string.IsNullOrEmpty(CurrentState.Run.GameName) ? gameName : CurrentState.Run.GameName;
-                                categoryName = string.IsNullOrEmpty(CurrentState.Run.CategoryName) ? categoryName : CurrentState.Run.CategoryName;
-                            }
-                        }
-                        catch { }
-
-                        // Prefer the system time the run started (if LiveSplit exposes it),
-                        // otherwise estimate from the current timer time.
-                        DateTime startTime = DateTime.Now;
-                        try
-                        {
-                            object candidate = null;
-                            var state = CurrentState;
-                            if (state != null)
-                            {
-                                var t = state.GetType();
-                                // Try common property names that may represent the system start time
-                                var prop = t.GetProperty("AdjustedStartTime");
-                                if (prop != null)
-                                    candidate = prop.GetValue(state);
-                                if (candidate == null)
-                                {
-                                    prop = t.GetProperty("AttemptStarted");
-                                    if (prop != null)
-                                        candidate = prop.GetValue(state);
-                                }
-                                if (candidate == null)
-                                {
-                                    prop = t.GetProperty("AttemptStartedTime");
-                                    if (prop != null)
-                                        candidate = prop.GetValue(state);
-                                }
-                            }
-
-                            if (candidate != null)
-                            {
-                                if (candidate is DateTime dt)
-                                {
-                                    startTime = dt;
-                                }
-                                else if (candidate is DateTimeOffset dto)
-                                {
-                                    startTime = dto.LocalDateTime;
-                                }
-                                else
-                                {
-                                    var candType = candidate.GetType();
-                                    var toDate = candType.GetMethod("ToDateTime", Type.EmptyTypes);
-                                    if (toDate != null)
-                                    {
-                                        var res = toDate.Invoke(candidate, null);
-                                        if (res is DateTime dt2) startTime = dt2;
-                                    }
-                                    else
-                                    {
-                                        var dateProp = candType.GetProperty("DateTime") ?? candType.GetProperty("LocalDateTime") ?? candType.GetProperty("Value");
-                                        if (dateProp != null)
-                                        {
-                                            var res = dateProp.GetValue(candidate);
-                                            if (res is DateTime dt3) startTime = dt3;
-                                            else if (res is DateTimeOffset dto2) startTime = dto2.LocalDateTime;
-                                        }
-                                    }
-                                }
-                            }
-                            else
-                            {
-                                // Fallback: estimate the start time from CurrentTime
-                                var tm = CurrentState.CurrentTimingMethod;
-                                var elapsed = CurrentState.CurrentTime[tm] ?? TimeSpan.Zero;
-                                startTime = DateTime.Now - elapsed;
-                            }
-                        }
-                        catch { }
-
-                        string timestamp = startTime.ToString("yyyy-MM-dd HH.mm.ss");
-                        string fileName = $"{gameName} - {categoryName} - {timestamp}.json";
-                        // Remove or replace invalid filename chars
-                        foreach (var c in System.IO.Path.GetInvalidFileNameChars())
-                        {
-                            fileName = fileName.Replace(c, '_');
-                        }
-
-                        // Ensure the cached filename exists; if the run start has been captured earlier
-                        // it will be used. Otherwise compute it now (best effort).
-                        EnsureCachedAutoSaveFileName();
-                        string filePath = System.IO.Path.Combine(autoSaveDir, cachedAutoSaveFileName ?? fileName);
-                        SplitsStateWriter.SaveSplitsState(CurrentState, filePath);
-                        System.Diagnostics.Debug.WriteLine($"TimeAttackPause autosave saved to: {filePath}");
-                        saved = true;
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        System.Diagnostics.Debug.WriteLine($"TimeAttackPause autosave attempt failed for '{dir}': {ex.Message}");
-                    }
-                }
-
-                if (!saved)
-                {
-                    System.Diagnostics.Debug.WriteLine("TimeAttackPause autosave failed: no writable directory found.");
-                }
+                Debug.WriteLine($"TimeAttackPause autosave saved to: {filePath}");
+                return true;
             }
             catch (Exception ex)
             {
-                // Silently fail on autosave to not interrupt the run
-                System.Diagnostics.Debug.WriteLine($"TimeAttackPause autosave failed: {ex.Message}");
+                Debug.WriteLine($"TimeAttackPause autosave attempt failed for '{directory}': {ex.Message}");
+                return false;
             }
         }
 
