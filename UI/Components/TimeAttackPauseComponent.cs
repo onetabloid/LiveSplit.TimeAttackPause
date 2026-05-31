@@ -1,11 +1,13 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Drawing;
-using System.Windows.Forms;
-using System.Xml;
-using LiveSplit.Model;
+﻿using LiveSplit.Model;
 using LiveSplit.TimeAttackPause.IO;
 using LiveSplit.TimeAttackPause.UI.Components;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Windows.Forms;
+using System.Xml;
 
 namespace LiveSplit.UI.Components
 {
@@ -18,8 +20,55 @@ namespace LiveSplit.UI.Components
         // This object contains all of the current information about the splits, the timer, etc.
         private LiveSplitState CurrentState { get; set; }
 
-        public override string ComponentName => "TimeAttackPause";
+        // Track the last seen split index to detect when the run's split index changes
+        private int lastSeenSplitIndex = -1;
+        // Cached autosave filename for the active run so multiple autosaves don't overwrite different files
+        private string cachedAutoSaveFileName = null;
 
+        // Builds and caches the autosave filename. If runStartTime is provided, it will be used
+        // as the timestamp for the filename. Otherwise the method will attempt to discover
+        // the run start time via LiveSplitState properties or fall back to estimating from CurrentTime.
+        private void EnsureCachedAutoSaveFileName(DateTime? runStartTime = null)
+        {
+            if (!string.IsNullOrEmpty(cachedAutoSaveFileName))
+            {
+                return;
+            }
+
+            var gameName = GetValueOrDefault(CurrentState?.Run?.GameName, "Unknown Game");
+            var categoryName = GetValueOrDefault(CurrentState?.Run?.CategoryName, "Unknown Category");
+            var startTime = runStartTime ?? GetRunStartTime();
+
+            var timestamp = startTime.ToString("yyyy-MM-dd-HH.mm.ss");
+            var fileName = $"{gameName} - {categoryName} - {timestamp}.json";
+
+            cachedAutoSaveFileName = SanitiseFileName(fileName);
+        }
+
+        private static string GetValueOrDefault(string value, string fallback)
+        {
+            return string.IsNullOrWhiteSpace(value) ? fallback : value;
+        }
+
+        private DateTime GetRunStartTime()
+        {
+            var timingMethod = CurrentState.CurrentTimingMethod;
+            var elapsed = CurrentState.CurrentTime[timingMethod] ?? TimeSpan.Zero;
+
+            return DateTime.Now - elapsed;
+        }
+
+        private static string SanitiseFileName(string fileName)
+        {
+            foreach (var invalidCharacter in Path.GetInvalidFileNameChars())
+            {
+                fileName = fileName.Replace(invalidCharacter, '_');
+            }
+
+            return fileName;
+        }
+
+        public override string ComponentName => "TimeAttackPause";
         public override float HorizontalWidth => 0;
         public override float MinimumWidth => 0;
         public override float VerticalHeight => 0;
@@ -88,6 +137,9 @@ namespace LiveSplit.UI.Components
             }
 
             SplitStateImporter.ImportState(openFileDialog.FileName, CurrentState, Model);
+
+            lastSeenSplitIndex = CurrentState.CurrentSplitIndex;
+            cachedAutoSaveFileName = null;
         }
 
         static void ErrorCallback(Form form, Exception ex)
@@ -120,6 +172,130 @@ namespace LiveSplit.UI.Components
             LayoutMode mode)
         {
             CurrentState = state;
+
+            // Detect split index changes (increase = new split, decrease = reset/undo)
+            if (CurrentState.CurrentSplitIndex < lastSeenSplitIndex)
+            {
+                try
+                {
+                    System.Diagnostics.Debug.WriteLine($"TimeAttackPause: detected split index decrease from {lastSeenSplitIndex} to {CurrentState.CurrentSplitIndex}, syncing tracker.");
+                }
+                catch { }
+                lastSeenSplitIndex = CurrentState.CurrentSplitIndex;
+                // Clear cached filename only when the run is reset to the very start (index == 0)
+                if (CurrentState.CurrentSplitIndex == 0)
+                {
+                    cachedAutoSaveFileName = null;
+                }
+            }
+            else if (CurrentState.CurrentSplitIndex > lastSeenSplitIndex)
+            {
+                // If the run just started (0 -> 1) capture the system start time and cache the filename
+                if (lastSeenSplitIndex == 0 && CurrentState.CurrentSplitIndex == 1)
+                {
+                    EnsureCachedAutoSaveFileName(DateTime.Now);
+                }
+
+                // Auto-save when the split index increases (but not on the initial start at index 0)
+                if (CurrentState.CurrentSplitIndex > 0)
+                {
+                    AutoSaveRun();
+                }
+
+                lastSeenSplitIndex = CurrentState.CurrentSplitIndex;
+            }
+        }
+
+        // Auto-saves the current run state
+        private void AutoSaveRun()
+        {
+            if (ShouldSkipAutoSave())
+            {
+                return;
+            }
+
+            foreach (var directory in GetAutoSaveDirectoryCandidates())
+            {
+                if (TryAutoSaveToDirectory(directory))
+                {
+                    return;
+                }
+            }
+
+            Debug.WriteLine("TimeAttackPause autosave failed: no writable directory found.");
+        }
+
+        private bool ShouldSkipAutoSave()
+        {
+            if (ImportContext.IsImporting)
+            {
+                Debug.WriteLine("Import in progress, Auto-Saves paused");
+                return true;
+            }
+
+            if (Settings?.EnableAutosave == false)
+            {
+                Debug.WriteLine("TimeAttackPause autosave skipped because EnableAutosave is false.");
+                return true;
+            }
+
+            return false;
+        }
+
+        private IEnumerable<string> GetAutoSaveDirectoryCandidates()
+        {
+            if (!string.IsNullOrWhiteSpace(Settings?.DefaultSavePath))
+            {
+                yield return Settings.DefaultSavePath;
+            }
+
+            yield return Path.Combine(GetApplicationRoot(), "TimeAttackPauseAutosaves");
+
+            yield return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                "LiveSplit",
+                "TimeAttackPauseAutosaves"
+            );
+
+            yield return Path.GetTempPath();
+        }
+
+        private string GetApplicationRoot()
+        {
+            try
+            {
+                return Application.StartupPath;
+            }
+            catch
+            {
+                return AppDomain.CurrentDomain.BaseDirectory;
+            }
+        }
+
+        private bool TryAutoSaveToDirectory(string directory)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(directory))
+                {
+                    return false;
+                }
+
+                Directory.CreateDirectory(directory);
+
+                EnsureCachedAutoSaveFileName();
+
+                var filePath = Path.Combine(directory, cachedAutoSaveFileName);
+                SplitsStateWriter.SaveSplitsState(CurrentState, filePath);
+
+                Debug.WriteLine($"TimeAttackPause autosave saved to: {filePath}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"TimeAttackPause autosave attempt failed for '{directory}': {ex.Message}");
+                return false;
+            }
         }
 
         // I do not know what this is for.
